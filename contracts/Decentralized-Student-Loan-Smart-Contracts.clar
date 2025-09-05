@@ -8,6 +8,9 @@
 (define-constant ERR-GRACE-PERIOD-EXISTS (err u107))
 (define-constant ERR-NO-GRACE-PERIOD (err u108))
 (define-constant ERR-INVALID-GRACE-PERIOD (err u109))
+(define-constant ERR-REFINANCING-REQUEST-EXISTS (err u110))
+(define-constant ERR-NO-REFINANCING-REQUEST (err u111))
+(define-constant ERR-INVALID-REFINANCING-TERMS (err u112))
 
 (define-data-var contract-owner principal tx-sender)
 (define-data-var min-credit-score uint u650)
@@ -120,6 +123,18 @@
     }
 )
 
+(define-map RefinancingRequests
+    principal
+    {
+        new-interest-rate: uint,
+        new-term-months: uint,
+        new-credit-score: uint,
+        justification: (string-ascii 200),
+        request-block: uint,
+        approved: bool,
+    }
+)
+
 (define-public (request-grace-period
         (months uint)
         (reason (string-ascii 100))
@@ -188,4 +203,125 @@
 
 (define-read-only (get-grace-period-request (student principal))
     (ok (map-get? GracePeriodRequests student))
+)
+
+(define-public (request-refinancing
+        (new-interest-rate uint)
+        (new-term-months uint)
+        (new-credit-score uint)
+        (justification (string-ascii 200))
+    )
+    (let (
+            (loan (unwrap! (map-get? StudentLoans tx-sender) ERR-NO-LOAN-EXISTS))
+            (current-monthly-payment (get monthly-payment loan))
+            (remaining-balance (- (get amount loan) (get total-paid loan)))
+            (new-monthly-payment (calculate-monthly-payment-with-rate remaining-balance
+                new-term-months new-interest-rate
+            ))
+        )
+        (asserts! (get approved loan) ERR-LOAN-NOT-APPROVED)
+        (asserts! (not (get defaulted loan)) ERR-LOAN-DEFAULTED)
+        (asserts! (is-none (map-get? RefinancingRequests tx-sender))
+            ERR-REFINANCING-REQUEST-EXISTS
+        )
+        (asserts! (>= new-credit-score (get credit-score loan))
+            ERR-INVALID-REFINANCING-TERMS
+        )
+        (asserts! (< new-monthly-payment current-monthly-payment)
+            ERR-INVALID-REFINANCING-TERMS
+        )
+        (asserts! (> new-term-months u0) ERR-INVALID-REFINANCING-TERMS)
+        (ok (map-set RefinancingRequests tx-sender {
+            new-interest-rate: new-interest-rate,
+            new-term-months: new-term-months,
+            new-credit-score: new-credit-score,
+            justification: justification,
+            request-block: stacks-block-height,
+            approved: false,
+        }))
+    )
+)
+
+(define-public (approve-refinancing (student principal))
+    (let (
+            (loan (unwrap! (map-get? StudentLoans student) ERR-NO-LOAN-EXISTS))
+            (request (unwrap! (map-get? RefinancingRequests student)
+                ERR-NO-REFINANCING-REQUEST
+            ))
+            (remaining-balance (- (get amount loan) (get total-paid loan)))
+            (new-monthly-payment (calculate-monthly-payment-with-rate remaining-balance
+                (get new-term-months request)
+                (get new-interest-rate request)
+            ))
+        )
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+        (asserts! (not (get approved request)) ERR-REFINANCING-REQUEST-EXISTS)
+        (map-delete RefinancingRequests student)
+        (ok (map-set StudentLoans student
+            (merge loan {
+                term-length: (get new-term-months request),
+                monthly-payment: new-monthly-payment,
+                credit-score: (get new-credit-score request),
+                amount: remaining-balance,
+                total-paid: u0,
+            })
+        ))
+    )
+)
+
+(define-public (deny-refinancing (student principal))
+    (let ((request (unwrap! (map-get? RefinancingRequests student)
+            ERR-NO-REFINANCING-REQUEST
+        )))
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+        (asserts! (not (get approved request)) ERR-REFINANCING-REQUEST-EXISTS)
+        (ok (map-delete RefinancingRequests student))
+    )
+)
+
+(define-read-only (calculate-monthly-payment-with-rate
+        (amount uint)
+        (term-months uint)
+        (rate uint)
+    )
+    (let (
+            (interest-amount (* amount rate))
+            (total-amount (+ amount interest-amount))
+        )
+        (/ total-amount term-months)
+    )
+)
+
+(define-read-only (get-refinancing-request (student principal))
+    (ok (map-get? RefinancingRequests student))
+)
+
+(define-read-only (calculate-refinancing-savings (student principal))
+    (let (
+            (loan (map-get? StudentLoans student))
+            (request (map-get? RefinancingRequests student))
+        )
+        (match loan
+            loan-data (match request
+                request-data (let (
+                        (current-payment (get monthly-payment loan-data))
+                        (remaining-balance (- (get amount loan-data) (get total-paid loan-data)))
+                        (new-payment (calculate-monthly-payment-with-rate remaining-balance
+                            (get new-term-months request-data)
+                            (get new-interest-rate request-data)
+                        ))
+                        (monthly-savings (- current-payment new-payment))
+                        (total-savings (* monthly-savings (get new-term-months request-data)))
+                    )
+                    (ok {
+                        monthly-savings: monthly-savings,
+                        total-savings: total-savings,
+                        new-monthly-payment: new-payment,
+                    })
+                )
+                (err ERR-NO-REFINANCING-REQUEST)
+            )
+            (err ERR-NO-LOAN-EXISTS)
+        )
+    )
 )
