@@ -11,11 +11,14 @@
 (define-constant ERR-REFINANCING-REQUEST-EXISTS (err u110))
 (define-constant ERR-NO-REFINANCING-REQUEST (err u111))
 (define-constant ERR-INVALID-REFINANCING-TERMS (err u112))
+(define-constant ERR-LOAN-FULLY-PAID (err u113))
+(define-constant ERR-INSUFFICIENT-PAYOFF-AMOUNT (err u114))
 
 (define-data-var contract-owner principal tx-sender)
 (define-data-var min-credit-score uint u650)
 (define-data-var interest-rate uint u5)
 (define-data-var max-grace-period-months uint u6)
+(define-data-var early-payoff-discount-rate uint u30)
 
 (define-map StudentLoans
     principal
@@ -322,6 +325,81 @@
                 (err ERR-NO-REFINANCING-REQUEST)
             )
             (err ERR-NO-LOAN-EXISTS)
+        )
+    )
+)
+
+(define-read-only (calculate-early-payoff-amount (student principal))
+    (let ((loan (map-get? StudentLoans student)))
+        (match loan
+            loan-data (let (
+                    (original-amount (get amount loan-data))
+                    (total-paid (get total-paid loan-data))
+                    (remaining-principal (- original-amount total-paid))
+                    (total-interest (* original-amount (var-get interest-rate)))
+                    (interest-per-payment (/ total-interest (get term-length loan-data)))
+                    (payments-made (/ total-paid (get monthly-payment loan-data)))
+                    (remaining-payments (- (get term-length loan-data) payments-made))
+                    (remaining-interest (* interest-per-payment remaining-payments))
+                    (discount-amount (/
+                        (* remaining-interest
+                            (var-get early-payoff-discount-rate)
+                        )
+                        u100
+                    ))
+                    (discounted-interest (- remaining-interest discount-amount))
+                    (total-payoff-amount (+ remaining-principal discounted-interest))
+                )
+                (ok {
+                    remaining-principal: remaining-principal,
+                    remaining-interest: remaining-interest,
+                    discount-amount: discount-amount,
+                    discounted-interest: discounted-interest,
+                    total-payoff-amount: total-payoff-amount,
+                })
+            )
+            (err ERR-NO-LOAN-EXISTS)
+        )
+    )
+)
+
+(define-public (execute-early-payoff)
+    (let (
+            (loan (unwrap! (map-get? StudentLoans tx-sender) ERR-NO-LOAN-EXISTS))
+            (payoff-details (unwrap! (calculate-early-payoff-amount tx-sender) ERR-NO-LOAN-EXISTS))
+            (payoff-amount (get total-payoff-amount payoff-details))
+            (remaining-balance (- (get amount loan) (get total-paid loan)))
+        )
+        (asserts! (get approved loan) ERR-LOAN-NOT-APPROVED)
+        (asserts! (not (get defaulted loan)) ERR-LOAN-DEFAULTED)
+        (asserts! (> remaining-balance u0) ERR-LOAN-FULLY-PAID)
+        (try! (stx-transfer? payoff-amount tx-sender (var-get contract-owner)))
+        (ok (map-set StudentLoans tx-sender
+            (merge loan {
+                total-paid: (get amount loan),
+                last-payment: stacks-block-height,
+            })
+        ))
+    )
+)
+
+(define-public (update-early-payoff-discount (new-discount-rate uint))
+    (begin
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+        (asserts! (<= new-discount-rate u100) ERR-NOT-AUTHORIZED)
+        (ok (var-set early-payoff-discount-rate new-discount-rate))
+    )
+)
+
+(define-read-only (get-early-payoff-discount-rate)
+    (ok (var-get early-payoff-discount-rate))
+)
+
+(define-read-only (is-loan-paid-off (student principal))
+    (let ((loan (map-get? StudentLoans student)))
+        (match loan
+            loan-data (ok (>= (get total-paid loan-data) (get amount loan-data)))
+            (ok false)
         )
     )
 )
